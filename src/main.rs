@@ -54,9 +54,14 @@ fn main() -> std::io::Result<()> {
     // recovered state from the first command it sends.
     let wal = WriteAheadLog::new(WAL_PATH)?;
     let mut replayed = 0usize;
-    for entry in wal.iter_entries() {
-        replay_entry(&entry, &store);
-        replayed += 1;
+    {
+        // Nothing else is running yet, so take the lock once for the
+        // whole replay rather than re-acquiring it per entry.
+        let mut map = store.lock().unwrap();
+        for entry in wal.iter_entries() {
+            replay_entry(&entry, &mut map);
+            replayed += 1;
+        }
     }
     if replayed > 0 {
         println!("recovered {replayed} entries from {WAL_PATH}");
@@ -94,6 +99,11 @@ fn handle_client(stream: TcpStream, store: SharedStore, wal: SharedWal) -> std::
     let peer = stream.peer_addr()?;
     println!("client connected: {peer}");
 
+    // A strict request/response protocol never wants Nagle's algorithm:
+    // it holds small writes back waiting for more data to coalesce, but
+    // there is no more data coming until the client sees this reply.
+    stream.set_nodelay(true)?;
+
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
@@ -113,13 +123,15 @@ fn handle_client(stream: TcpStream, store: SharedStore, wal: SharedWal) -> std::
         }
 
         // DAY 2: parse the line into a command + arguments.
-        let response = handle_command(&line, &store, &wal);
+        let mut response = handle_command(&line, &store, &wal);
 
-        // Write the reply back, followed by a newline so simple clients
-        // (like `nc`) render it cleanly.
+        // Write the reply back with its terminating newline in ONE write.
+        // Sending the newline as a second write makes it a tiny trailing
+        // segment that Nagle holds until the peer ACKs the first one -
+        // and the peer's delayed-ACK timer sits on that for ~40ms, which
+        // capped this server at roughly 25 responses/sec.
+        response.push('\n');
         writer.write_all(response.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
     }
 
     println!("client disconnected: {peer}");
@@ -145,13 +157,10 @@ fn handle_command(line: &str, store: &SharedStore, wal: &SharedWal) -> String {
                     // must succeed BEFORE we touch the in-memory store.
                     // If it fails, the client is told and nothing changes -
                     // we never want the store ahead of what's durable.
-                    if let Err(e) = write_and_sync(wal, &format!("SET {k} {v}")) {
-                        return format!("ERR failed to persist write: {e}");
+                    match commit(store, wal, &format!("SET {k} {v}"), |map| apply_set(map, k, v)) {
+                        Ok(()) => "OK".to_string(),
+                        Err(e) => format!("ERR failed to persist write: {e}"),
                     }
-                    // DAY 3: lock the mutex, insert, then the lock is
-                    // automatically released when `map` goes out of scope.
-                    apply_set(store, k, v);
-                    "OK".to_string()
                 }
                 // DAY 5: malformed command - don't crash, just tell the client.
                 _ => "ERR wrong number of arguments for 'SET'".to_string(),
@@ -180,13 +189,10 @@ fn handle_command(line: &str, store: &SharedStore, wal: &SharedWal) -> String {
                     // Log the delete before applying it, same as SET - and
                     // unconditionally, even if the key turns out not to
                     // exist, so replay stays a faithful redo of history.
-                    if let Err(e) = write_and_sync(wal, &format!("DEL {k}")) {
-                        return format!("ERR failed to persist write: {e}");
-                    }
-                    if apply_del(store, k) {
-                        "1".to_string() // 1 key was deleted
-                    } else {
-                        "0".to_string() // nothing to delete
+                    match commit(store, wal, &format!("DEL {k}"), |map| apply_del(map, k)) {
+                        Ok(true) => "1".to_string(),  // 1 key was deleted
+                        Ok(false) => "0".to_string(), // nothing to delete
+                        Err(e) => format!("ERR failed to persist write: {e}"),
                     }
                 }
                 None => "ERR wrong number of arguments for 'DEL'".to_string(),
@@ -207,44 +213,66 @@ fn handle_command(line: &str, store: &SharedStore, wal: &SharedWal) -> String {
     }
 }
 
-// STAGE 2: append one entry to the WAL and opportunistically sync.
-// A sync failure is logged but NOT treated as a write failure - the
-// entry is safely appended either way, it just isn't durable yet.
-fn write_and_sync(wal: &SharedWal, entry: &str) -> std::io::Result<()> {
+// STAGE 2: append one entry to the WAL, then apply it to the store -
+// as a SINGLE atomic step.
+//
+// Holding the WAL lock across the in-memory update is the whole point.
+// An earlier version released it first, which let two threads append in
+// one order and apply in the opposite one: memory would serve the value
+// from the last writer to grab the store lock, while the log recorded
+// the other. Nobody noticed until a restart replayed the log and the
+// server silently started serving a different value.
+//
+// Deadlock safety: this is the only place that holds both locks, and it
+// always takes them in the same order (WAL, then store). Every other
+// path takes just one - GET and replay take the store, SYNC takes the
+// WAL - so there is no cycle to deadlock on.
+//
+// A sync failure is logged but NOT treated as a write failure: the
+// entry is appended either way, it just isn't durable yet.
+fn commit<T>(
+    store: &SharedStore,
+    wal: &SharedWal,
+    entry: &str,
+    apply: impl FnOnce(&mut HashMap<String, String>) -> T,
+) -> std::io::Result<T> {
     let mut log = wal.lock().unwrap();
     log.append(entry)?;
     if let Err(e) = log.maybe_sync(WAL_SYNC_THRESHOLD) {
         eprintln!("WAL sync failed: {e}");
     }
-    Ok(())
+    let mut map = store.lock().unwrap();
+    Ok(apply(&mut map))
 }
 
 // The actual store mutations, factored out so both the live client
-// path (after a successful WAL write) and startup replay (which must
-// NOT re-append to the WAL) share the same logic.
-fn apply_set(store: &SharedStore, key: &str, value: &str) {
-    store.lock().unwrap().insert(key.to_string(), value.to_string());
+// path (inside `commit`, after a successful WAL write) and startup
+// replay (which must NOT re-append to the WAL) share the same logic.
+// They take the map directly rather than the mutex, so the caller
+// decides how long the lock is held.
+fn apply_set(map: &mut HashMap<String, String>, key: &str, value: &str) {
+    map.insert(key.to_string(), value.to_string());
 }
 
-fn apply_del(store: &SharedStore, key: &str) -> bool {
-    store.lock().unwrap().remove(key).is_some()
+fn apply_del(map: &mut HashMap<String, String>, key: &str) -> bool {
+    map.remove(key).is_some()
 }
 
 // STAGE 2: replays a single WAL line into the store at startup.
 // Malformed entries are logged and skipped rather than aborting
 // recovery - a single corrupt line shouldn't lose the rest of history.
-fn replay_entry(entry: &str, store: &SharedStore) {
+fn replay_entry(entry: &str, map: &mut HashMap<String, String>) {
     let mut parts = entry.trim().splitn(3, ' ');
     let cmd = parts.next().unwrap_or("").to_uppercase();
 
     match cmd.as_str() {
         "SET" => match (parts.next(), parts.next()) {
-            (Some(k), Some(v)) => apply_set(store, k, v),
+            (Some(k), Some(v)) => apply_set(map, k, v),
             _ => eprintln!("WAL replay: skipping malformed SET entry: {entry:?}"),
         },
         "DEL" => match parts.next() {
             Some(k) => {
-                apply_del(store, k);
+                apply_del(map, k);
             }
             None => eprintln!("WAL replay: skipping malformed DEL entry: {entry:?}"),
         },
@@ -361,15 +389,83 @@ mod tests {
         env.wal.lock().unwrap().sync().unwrap();
 
         // Simulate a restart: fresh store, replay the same WAL file.
-        let fresh_store: SharedStore = Arc::new(Mutex::new(HashMap::new()));
-        let wal_path = env.wal_path.clone();
-        let recovery_wal = WriteAheadLog::new(&wal_path).expect("reopen WAL");
-        for entry in recovery_wal.iter_entries() {
-            replay_entry(&entry, &fresh_store);
-        }
-
-        let map = fresh_store.lock().unwrap();
+        let map = replay_file(&env.wal_path);
         assert_eq!(map.get("name"), Some(&"alice".to_string()));
         assert_eq!(map.get("city"), None);
+    }
+
+    // Rebuilds a store from a WAL file the way a restart would.
+    fn replay_file(path: &str) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let wal = WriteAheadLog::new(path).expect("reopen WAL");
+        for entry in wal.iter_entries() {
+            replay_entry(&entry, &mut map);
+        }
+        map
+    }
+
+    // REGRESSION (the real guard): `commit` must still hold the WAL lock
+    // at the moment it updates the store. The previous code released the
+    // WAL lock first, which let two writers append in one order and apply
+    // in the opposite one - memory then served one writer's value while
+    // the log recorded another's, and the server silently changed its
+    // answer after a restart.
+    //
+    // This asserts the invariant directly rather than racing for it, so
+    // it fails 100% of the time if the ordering regresses. A probabilistic
+    // version needed thousands of iterations and only reproduced when an
+    // fsync happened to widen the window - far too flaky to rely on.
+    #[test]
+    fn commit_holds_wal_lock_while_updating_store() {
+        let env = TestEnv::new("commit_atomicity");
+        let probe_target = Arc::clone(&env.wal);
+
+        let wal_was_locked = commit(&env.store, &env.wal, "SET k v", |map| {
+            apply_set(map, "k", "v");
+            // Probe from a separate thread so "already locked" is
+            // unambiguous - re-locking from the holding thread is not
+            // well-defined behaviour.
+            thread::spawn(move || probe_target.try_lock().is_err())
+                .join()
+                .expect("probe thread panicked")
+        })
+        .expect("commit failed");
+
+        assert!(
+            wal_was_locked,
+            "commit released the WAL lock before updating the store: concurrent \
+             writers can interleave, leaving memory disagreeing with the log"
+        );
+    }
+
+    // Companion smoke test: under real concurrent writers, the in-memory
+    // value must be the one a restart would reconstruct. This alone is
+    // too timing-dependent to catch the bug reliably (see above), but it
+    // exercises the genuine multi-threaded path end to end.
+    #[test]
+    fn concurrent_writes_keep_store_and_wal_in_agreement() {
+        for attempt in 0..500 {
+            let env = TestEnv::new(&format!("race_{attempt}"));
+
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let store = Arc::clone(&env.store);
+                    let wal = Arc::clone(&env.wal);
+                    thread::spawn(move || {
+                        handle_command(&format!("SET k v{i}"), &store, &wal);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("writer thread panicked");
+            }
+
+            let in_memory = env.store.lock().unwrap().get("k").cloned();
+            let after_restart = replay_file(&env.wal_path).get("k").cloned();
+            assert_eq!(
+                in_memory, after_restart,
+                "attempt {attempt}: store says {in_memory:?} but a restart would give {after_restart:?}"
+            );
+        }
     }
 }

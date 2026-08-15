@@ -77,9 +77,17 @@ without you having to `SET` it again.
 - The difference between `String` and `&str` when parsing input.
 - Handling a disconnecting client without panicking the whole server.
 - Why the WAL write has to succeed *before* the in-memory store is
-  touched (transactional ordering) - and why locking the WAL and the
-  store in a fixed order (WAL, then store, never both at once)
-  avoids deadlocks.
+  touched (transactional ordering) - and that ordering the two writes
+  is not enough on its own. Releasing the WAL lock before taking the
+  store lock let two threads append in one order and apply in the
+  other, so memory and the log disagreed and the server silently
+  changed its answer after a restart. Both locks have to be held
+  across the whole mutation; taking them in a consistent order
+  (WAL, then store) is what keeps that deadlock-free.
+- That a request/response server must never split one reply into two
+  socket writes: Nagle's algorithm holds the second small write until
+  the peer ACKs the first, and the peer's delayed-ACK timer sits on it
+  for ~40ms. That single detail capped this server at ~25 ops/sec.
 - Why fsync is batched instead of called on every write: it's the
   expensive part of durability, so committing every N writes trades
   a little recovery risk (writes since the last sync are still in
