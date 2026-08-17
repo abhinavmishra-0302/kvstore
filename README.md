@@ -14,7 +14,7 @@ milestones.
 |-------|---------------|--------|
 | 1 | In-memory TCP server, concurrent clients | Done |
 | 2 | Write-ahead log, crash recovery on startup | Done |
-| 3 | Leader-follower replication | Planned |
+| 3 | Leader-follower replication | Done |
 
 ## Quick start
 
@@ -141,8 +141,9 @@ again, and `GET` the key without setting it first.
 ## How it's put together
 
 ```
-src/main.rs   server loop, connection handling, command parsing, replay
-src/wal.rs    the write-ahead log: append, fsync, iterate for replay
+src/main.rs          server loop, connection handling, command parsing, replay
+src/wal.rs           the write-ahead log: append, fsync, iterate for replay
+src/replication.rs   CLI config, leader-side Replicator, follower-side FollowerListener
 ```
 
 The server spawns one OS thread per connection. All threads share a
@@ -159,15 +160,79 @@ value. `commit()` is the only path that takes both locks and it always
 takes them in the same order (WAL, then store), so it can't deadlock
 against `GET` or `SYNC`, which each take only one.
 
+## Replication
+
+A leader forwards every write it commits to its followers. A follower
+connects out to the leader, registers itself, and applies whatever it
+receives to its own store *and its own WAL* — so a follower is
+independently durable, not just a cache of the leader.
+
+```sh
+# terminal 1: leader
+cargo run -- --node-id leader1 --is-leader --listen-port 6380 --repl-port 6381
+
+# terminal 2: follower
+cargo run -- --node-id follower1 --leader-addr 127.0.0.1:6381 --listen-port 6390
+```
+
+```
+SET on leader (port 6380):   SET name abhinav  ->  OK
+GET on follower (port 6390): GET name          ->  abhinav   (shortly after)
+SET on follower (port 6390): SET x y           ->  ERR write commands are not allowed on a read-only follower
+```
+
+How it fits together:
+
+- **Two ports on the leader.** `--listen-port` (default `6380`) is for
+  clients; `--repl-port` (default `6381`) is a separate port that only
+  followers connect to, so a follower can never accidentally show up as
+  a regular client and vice versa.
+- **Handshake.** A follower opens a connection to the leader's
+  `repl-port` and sends `REGISTER <node-id>`; the leader replies `OK`
+  and keeps that connection open as a one-way command feed.
+- **Fan-out, not consensus.** After a write commits locally (WAL, then
+  store — same as Stage 2), the leader writes the same line to every
+  registered follower's socket. There's no acknowledgement and no
+  quorum: a follower that's behind or disconnected doesn't block or
+  fail the client's write. This is deliberately eventually consistent.
+- **A dead follower is dropped, not retried.** If a write to a
+  follower's socket fails, that follower is removed from the leader's
+  list. It has to reconnect (and re-register) to start receiving
+  writes again.
+- **A follower reconnects on its own.** If the leader connection drops,
+  the follower retries once a second until it succeeds, re-registering
+  each time.
+- **Read-only, not read-blocked.** A follower still answers `GET` and
+  `PING` from clients on its own `--listen-port`; it only rejects `SET`
+  and `DEL`, since the leader is the only source of truth for writes.
+- **Separate WAL per node.** `--node-id` scopes the log file to
+  `data-<node-id>.log`, so a leader and follower running on the same
+  machine (the normal way to test this locally) don't collide on the
+  same file. Omit every flag and you get the Stage 1/2 behavior back
+  exactly: a single standalone node writing to `data.log`.
+- **Restart a follower and it doesn't need the leader.** It replays its
+  own WAL first, then reconnects and picks up from wherever the leader
+  is — try `SET` on the leader, stop the follower, restart it, and
+  `GET` the key before the leader sends anything new.
+
 ## Configuration
 
-There is no config file or command-line parsing yet. These are
-compile-time values in `src/main.rs` — change them and rebuild:
+Command-line flags, all optional — omit them all and you get a single
+standalone node on `127.0.0.1:6380`, same as Stage 1/2:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--node-id <id>` | `default` | identifies this node in logs and scopes its WAL filename |
+| `--is-leader` | off | accept follower registrations and replicate writes |
+| `--listen-port <port>` | `6380` | port clients connect to |
+| `--repl-port <port>` | `6381` | leader-only: port followers register on |
+| `--leader-addr <host:port>` | none | run as a follower of the leader's `--repl-port` |
+
+A few values are still compile-time constants in `src/main.rs`:
 
 | Value | Default | Meaning |
 |-------|---------|---------|
-| listen address | `127.0.0.1:6380` | bind address, inline in `main()` |
-| `WAL_PATH` | `data.log` | log file, relative to the working directory |
+| `WAL_PATH` | `data.log` | log filename used when `--node-id` is left at `default` |
 | `WAL_SYNC_THRESHOLD` | `100` | writes to buffer before forcing an fsync |
 
 ## Testing
@@ -176,8 +241,8 @@ compile-time values in `src/main.rs` — change them and rebuild:
 cargo test
 ```
 
-15 tests covering command handling, WAL append and replay, and
-concurrency. Two are worth calling out:
+24 tests covering command handling, WAL append and replay, concurrency,
+and replication. A few are worth calling out:
 
 - `commit_holds_wal_lock_while_updating_store` asserts the atomicity
   invariant directly, by probing from another thread that the WAL lock
@@ -188,6 +253,16 @@ concurrency. Two are worth calling out:
   reconstruct. It's a smoke test, not the real guard — reproducing the
   race by racing for it turned out to be far too timing-dependent to
   rely on.
+- `test_replicate_to_all_drops_dead_follower` closes one end of a real
+  loopback socket and asserts the `Replicator` prunes it. TCP doesn't
+  always surface a broken connection on the first write after the peer
+  disappears, so it retries a bounded number of times rather than
+  asserting on the first attempt.
+- `test_leader_replicates_committed_write_to_follower` and
+  `test_follower_listener_registers_and_applies_commands` exercise the
+  replication wire protocol end to end over real loopback sockets
+  (registration handshake, then command fan-out), not just the parsing
+  logic in isolation.
 
 Tests write their own `test_*.log` files and clean up after themselves.
 
@@ -232,12 +307,24 @@ These are real and known, not hidden:
   there.
 - **One OS thread per connection**, spawned without limit. Fine for a
   handful of clients, not for thousands of mostly-idle ones.
-- Single node only — no replication or failover yet.
+- **Replication has no consensus or failover.** If the leader dies, a
+  follower does not promote itself — it just keeps retrying a dead
+  address. There is no leader election, and a follower's data can lag
+  the leader's by an unbounded amount if it's been disconnected.
+- **A follower's WAL can diverge from a from-scratch replay of the
+  leader's**, since it only records what it actually received, in the
+  order it received it — a follower that missed a window of writes
+  while disconnected has gaps, not corruption, but its log is not a
+  byte-for-byte copy of the leader's.
+- **No authentication between leader and follower.** Anything that can
+  reach `--repl-port` and speaks the `REGISTER` handshake gets a
+  replication feed.
 
 ## Roadmap
 
-Stage 3 is leader-follower replication, so a second node has the data
-too. Known efficiency work queued up behind it:
+Stage 4 (stretch) replaces the `HashMap` + full-file WAL with an
+LSM-tree-style storage engine. Known efficiency work queued up before
+that:
 
 - Buffer WAL writes through a `BufWriter` (~10x on appends, at the cost
   of a slightly wider crash window).
@@ -246,3 +333,4 @@ too. Known efficiency work queued up behind it:
 - Compare command names without allocating (`eq_ignore_ascii_case`
   instead of `to_uppercase`).
 - Log compaction or snapshotting, to stop startup cost growing forever.
+- Leader election / failover, so a follower can take over automatically.
