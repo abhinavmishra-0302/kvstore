@@ -60,7 +60,7 @@ impl WriteAheadLog {
     pub fn iter_entries(&self) -> impl Iterator<Item = String> {
         let file = File::open(&self.path).expect("failed to open WAL file for reading");
         let reader = BufReader::new(file);
-        reader.lines().filter_map(|line| line.ok())
+        reader.lines().map_while(Result::ok)
     }
 }
 

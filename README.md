@@ -5,10 +5,10 @@ external crates, just the standard library. It speaks a simple
 line-based protocol over TCP, keeps data in memory, and writes every
 mutation to a write-ahead log so a restart doesn't lose anything.
 
-This is a learning project built in stages. The source is written to be
-read top to bottom: `src/main.rs` carries `DAY N` comments marking what
-each day of the build added, and `STAGE N` comments marking the larger
-milestones.
+This is a learning project built in stages. The source carries `DAY N`
+comments marking what each day of the Stage 1 build added, and `STAGE N`
+comments marking the larger milestones, wherever that code ended up
+living after the module split described below.
 
 | Stage | What it added | Status |
 |-------|---------------|--------|
@@ -140,25 +140,45 @@ again, and `GET` the key without setting it first.
 
 ## How it's put together
 
+The real logic lives in a library (`src/lib.rs` and its submodules);
+`src/main.rs` is a five-line shim that reads CLI flags and calls
+`kvstore::run()`. That split is what lets `tests/integration_test.rs`
+start real nodes in-process and talk to them over real sockets, rather
+than shelling out to a separately-built binary.
+
 ```
-src/main.rs          server loop, connection handling, command parsing, replay
-src/wal.rs           the write-ahead log: append, fsync, iterate for replay
-src/replication.rs   CLI config, leader-side Replicator, follower-side FollowerListener
+src/lib.rs           module map + the public run()/ReplicationConfig re-exports
+src/server.rs         process bootstrap: bind listeners, wire everything together,
+                       the per-connection accept loop
+src/commands.rs       the client protocol: parse a line, dispatch it, apply
+                       read-only/replication behavior (ServerContext lives here)
+src/store.rs          the HashMap + WAL types, the atomic commit() path,
+                       raw apply_set/apply_del, and replay
+src/wal.rs            the write-ahead log itself: append, fsync, iterate for replay
+src/replication.rs    CLI config, leader-side Replicator, follower-side FollowerListener
+tests/integration_test.rs   black-box tests: spawn a real node, talk to it over TCP
 ```
+
+Each layer only depends on the ones below it: `server` calls into
+`commands` and `store`; `commands` calls into `store` and
+`replication`; `store` and `replication` don't know about each other
+or about anything above them. `wal` is a leaf - nothing but `store`
+touches it.
 
 The server spawns one OS thread per connection. All threads share a
 single `Arc<Mutex<HashMap<String, String>>>` for the data and an
-`Arc<Mutex<WriteAheadLog>>` for the log.
+`Arc<Mutex<WriteAheadLog>>` for the log, bundled together (plus the
+replicator and the read-only flag) in `commands::ServerContext`.
 
-Mutations go through `commit()`, which holds the WAL lock *across* the
-in-memory update so that appending and applying are a single atomic
-step. This matters: an earlier version released the WAL lock first,
-which let two threads append in one order and apply in the opposite
-one, leaving memory disagreeing with the log — invisible until a
-restart, when the server would silently start serving a different
-value. `commit()` is the only path that takes both locks and it always
-takes them in the same order (WAL, then store), so it can't deadlock
-against `GET` or `SYNC`, which each take only one.
+Mutations go through `store::commit()`, which holds the WAL lock
+*across* the in-memory update so that appending and applying are a
+single atomic step. This matters: an earlier version released the WAL
+lock first, which let two threads append in one order and apply in
+the opposite one, leaving memory disagreeing with the log — invisible
+until a restart, when the server would silently start serving a
+different value. `commit()` is the only path that takes both locks
+and it always takes them in the same order (WAL, then store), so it
+can't deadlock against `GET` or `SYNC`, which each take only one.
 
 ## Replication
 
@@ -228,7 +248,7 @@ standalone node on `127.0.0.1:6380`, same as Stage 1/2:
 | `--repl-port <port>` | `6381` | leader-only: port followers register on |
 | `--leader-addr <host:port>` | none | run as a follower of the leader's `--repl-port` |
 
-A few values are still compile-time constants in `src/main.rs`:
+A few values are still compile-time constants in `src/store.rs`:
 
 | Value | Default | Meaning |
 |-------|---------|---------|
@@ -241,8 +261,11 @@ A few values are still compile-time constants in `src/main.rs`:
 cargo test
 ```
 
-24 tests covering command handling, WAL append and replay, concurrency,
-and replication. A few are worth calling out:
+29 unit tests (colocated with the module they test - `store::tests`,
+`commands::tests`, `wal::tests`, `replication::tests`) plus 3 black-box
+integration tests in `tests/integration_test.rs` that spawn a real node
+through the public `kvstore::run()` API and only ever talk to it over a
+real TCP socket. A few are worth calling out:
 
 - `commit_holds_wal_lock_while_updating_store` asserts the atomicity
   invariant directly, by probing from another thread that the WAL lock
@@ -263,8 +286,15 @@ and replication. A few are worth calling out:
   replication wire protocol end to end over real loopback sockets
   (registration handshake, then command fan-out), not just the parsing
   logic in isolation.
+- `leader_replicates_to_follower_over_real_tcp` (in
+  `tests/integration_test.rs`) goes one level further: it starts an
+  actual leader and follower node through `kvstore::run()`, writes on
+  the leader over a real socket, and reads the replicated value back
+  from the follower over a different real socket - the same black-box
+  test a client of this server would run, just automated.
 
-Tests write their own `test_*.log` files and clean up after themselves.
+Tests write their own `test_*.log` / `data-<node-id>.log` files and
+clean up after themselves.
 
 ## Performance
 
